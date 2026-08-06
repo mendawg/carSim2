@@ -1,0 +1,71 @@
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+public class Intersection {
+
+    private final Double lat;
+    private final Double lon;
+    private final Long id;
+
+
+    private final List<Way> incomingWays = new ArrayList<>();
+    private final List<Way> outgoingWays = new ArrayList<>();
+
+    public Intersection(Long id, Double lat, Double lon) {
+        this.id = id;
+        this.lat = lat;
+        this.lon = lon;
+    }
+
+    public boolean hasGreenLight(Way way, double absTime){
+        if(incomingWays.size() <= 1) return true;
+
+        double greenDuration = 60.0;
+        int currentCycle = (int) (absTime / greenDuration);
+        int hasGreenIndex = currentCycle % incomingWays.size();
+        return incomingWays.indexOf(way) == hasGreenIndex;
+    }
+
+    public void addIncomingWay(Way way){
+        incomingWays.add(way);
+    }
+    public void addOutgoingWay(Way way){
+        outgoingWays.add(way);
+    }
+
+    public List<Way> getIncomingWays() {
+        return incomingWays;
+    }
+
+    public List<Way> getOutgoingWays() {
+        return outgoingWays;
+    }
+
+    public Double getLat() {
+        return lat;
+    }
+
+    public Double getLon() {
+        return lon;
+    }
+
+    public Long getId() {
+        return id;
+    }
+
+    public Set<Way> getWaysDeep(){
+        Set<Way> ways = new HashSet<>(incomingWays);
+        ways.addAll(outgoingWays);
+        Set<Way> allWays = new HashSet<>(ways);
+        for (Way w : ways){
+             Intersection node = w.getFinalNode();
+             if (node != null) {
+                 allWays.addAll(node.getIncomingWays());
+                 allWays.addAll(node.getOutgoingWays());
+             }
+        }
+        return allWays;
+    }
+}
