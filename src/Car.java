@@ -1,19 +1,15 @@
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Queue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.Queue;
 
 public class Car {
 
-
     private final AStar pathFinder;
-
     private Way currentWay;
 
-    private static double baseAcceleration = 1.8;
+    private static final double baseAcceleration = 1.8;
     private double currentSpeeed;
     private final double aggressivness;
     private double distTravelled;
@@ -21,14 +17,13 @@ public class Car {
     private final double acceleration;
     private final double deacceleration = 2.5;
     private double waitingTime = 0.0;
-    private final double maxWaitTime = 90 + ThreadLocalRandom.current().nextDouble(25,50);
+    private final double maxWaitTime;
     private double spawnWaitTime = 0.0;
-    private final double maxSpawnWait = 30.0 + ThreadLocalRandom.current().nextDouble(25,50);
+    private final double maxSpawnWait;
 
-    private boolean cameraAware;
+    private final boolean cameraAware;
     private boolean arrived;
     private boolean reportMade = false;
-    private boolean waiting = false;
     private boolean isSpawned = false;
 
     private final Queue<Main.Record> violationsQueue;
@@ -38,40 +33,46 @@ public class Car {
     private static final int MAX_REROUTE_ATTEMPTS = 5;
     private int currentWayIndex = 0;
 
-    private Intersection start,dest;
-
+    private Intersection start, dest;
     private List<Way> path;
-
     private final List<Intersection> intersections;
 
-    private void chooseRoute(){
+    private void chooseRoute() {
         int maxAttempts = 50;
         int attempts = 0;
-        while(attempts < maxAttempts){
+        int size = intersections.size();
+        ThreadLocalRandom rand = ThreadLocalRandom.current();
+
+        while (attempts < maxAttempts) {
             attempts++;
 
-            start = intersections.get(ThreadLocalRandom.current().nextInt(intersections.size()));
-            dest = intersections.get(ThreadLocalRandom.current().nextInt(intersections.size()));
+            start = intersections.get(rand.nextInt(size));
+            dest = intersections.get(rand.nextInt(size));
 
             if (dest == null || start == null || start.equals(dest)) continue;
+            // Szybkie odrzucenie węzłów bez dróg wyjściowych/wejściowych bez uruchamiania A*
+            if (start.getOutgoingWays().isEmpty() || dest.getIncomingWays().isEmpty()) continue;
 
             RouteKey key = new RouteKey(start.getId(), dest.getId());
 
+            // Nie używamy computeIfAbsent, aby nie blokować wątków podczas liczenia A*
+            path = routeCache.get(key);
+            if (path == null) {
+                List<Way> computed = pathFinder.findPath(start, dest);
+                path = (computed != null) ? computed : Collections.emptyList();
+                routeCache.putIfAbsent(key, path);
+            }
 
-            path = routeCache.computeIfAbsent(key, k -> pathFinder.findPath(start, dest));
-
-            if (path != null && !path.isEmpty()) break;
-
+            if (!path.isEmpty()) break;
         }
+
         if (path == null || path.isEmpty()) {
             this.arrived = true;
-            reportArrival();
             this.path = Collections.emptyList();
             return;
         }
         currentWayIndex = 0;
-        currentWay = path.get(currentWayIndex);
-
+        currentWay = path.get(0);
     }
 
     public Car(List<Intersection> intersections, AStar pathFinder, double dt, Queue<Main.Record> violationsQueue,
@@ -81,45 +82,45 @@ public class Car {
         this.violationsQueue = violationsQueue;
         this.routeCache = routeCache;
 
-        arrived = false;
-        distTravelled = 0.0;
-        currentSpeeed = 0.0;
+        ThreadLocalRandom rand = ThreadLocalRandom.current();
+        this.maxWaitTime = 90.0 + rand.nextDouble(25.0, 50.0);
+        this.maxSpawnWait = 30.0 + rand.nextDouble(25.0, 50.0);
+
+        this.arrived = false;
+        this.distTravelled = 0.0;
+        this.currentSpeeed = 0.0;
         this.dt = dt;
-        aggressivness = Gaussian.getRandomMultiplier();
-        cameraAware = ThreadLocalRandom.current().nextBoolean();
-        acceleration = baseAcceleration * aggressivness;
+        this.aggressivness = Gaussian.getRandomMultiplier();
+        this.cameraAware = rand.nextBoolean();
+        this.acceleration = baseAcceleration * aggressivness;
 
         chooseRoute();
     }
 
-    private void moveOnWay(double distance, double speedAtDistance){
+    private void moveOnWay(double distance, double speedAtDistance) {
         double desiredSpeed = currentWay.getBaseFlow() * aggressivness;
         double driverDesiredSpeed = desiredSpeed * currentWay.getTrafficFactor() * currentWay.getWeatherFactor();
         driverDesiredSpeed = Math.max(driverDesiredSpeed, 1.0);
 
         double brakingDist = 0;
-        if (currentSpeeed > speedAtDistance){
-            brakingDist = (Math.pow(currentSpeeed,2) - Math.pow(speedAtDistance, 2)) / (2 * deacceleration);
+        if (currentSpeeed > speedAtDistance) {
+            brakingDist = ((currentSpeeed * currentSpeeed) - (speedAtDistance * speedAtDistance)) / (2.0 * deacceleration);
             brakingDist += currentSpeeed * dt;
         }
-        if(distance - distTravelled <= brakingDist){
+        if (distance - distTravelled <= brakingDist) {
             currentSpeeed -= deacceleration * dt;
-            currentSpeeed = Math.max(currentSpeeed,speedAtDistance);
-        }else{
-            if (currentSpeeed < driverDesiredSpeed){
+            currentSpeeed = Math.max(currentSpeeed, speedAtDistance);
+        } else {
+            if (currentSpeeed < driverDesiredSpeed) {
                 currentSpeeed += acceleration * dt;
                 currentSpeeed = Math.min(currentSpeeed, driverDesiredSpeed);
-            }else if (currentSpeeed > driverDesiredSpeed){
+            } else if (currentSpeeed > driverDesiredSpeed) {
                 currentSpeeed -= deacceleration * dt;
                 currentSpeeed = Math.max(currentSpeeed, driverDesiredSpeed);
             }
         }
-
     }
 
-    private void reportArrival(){
-
-    }
     private void giveUp() {
         if (isSpawned && currentWay != null) {
             currentWay.leaveWay();
@@ -127,20 +128,19 @@ public class Car {
             isSpawned = false;
         }
         arrived = true;
-        reportArrival();
     }
 
     public void move(double absTime) {
         if (arrived) return;
-        if (!isSpawned){
-            if(currentWay.isFull()){
+        if (!isSpawned) {
+            if (currentWay.isFull()) {
                 spawnWaitTime += dt;
-                if (spawnWaitTime >= maxSpawnWait){
+                if (spawnWaitTime >= maxSpawnWait) {
                     spawnWaitTime = 0.0;
                     tryReroute(start);
                 }
                 return;
-            } else{
+            } else {
                 currentWay.enterWay();
                 currentWay.updateDensity();
                 isSpawned = true;
@@ -152,7 +152,6 @@ public class Car {
 
         Intersection currentTarget = currentWay.getFinalNode();
         boolean green = currentTarget.hasGreenLight(currentWay, absTime);
-
 
         Way nextWay = (currentWayIndex + 1 < path.size()) ? path.get(currentWayIndex + 1) : null;
 
@@ -179,7 +178,7 @@ public class Car {
             if (waitingTime >= maxWaitTime) {
                 waitingTime = 0.0;
                 Way oldWay = currentWay;
-                if (tryReroute(currentWay.getFinalNode())){
+                if (tryReroute(currentWay.getFinalNode())) {
                     oldWay.leaveWay();
                     oldWay.updateDensity();
                     currentWay.enterWay();
@@ -193,17 +192,40 @@ public class Car {
             waitingTime = 0.0;
         }
         if (arrived) return;
+
         moveOnWay(distanceToTravel, desiredSpeedAtPoint);
         distTravelled += currentSpeeed * dt;
+
+        // Generowanie 10 zróżnicowanych logów przy minięciu fotoradaru
         if (currentWay.getHasCamera() && !reportMade &&
                 distTravelled >= currentWay.getCameraLocation()) {
 
             reportMade = true;
-            violationsQueue.offer(new Main.Record(absTime, currentSpeeed, currentWay.getSpeedLimit(),
-                    currentWay.getCurvature(), currentWay.getTrueLength(), currentWay.getWayType(),
-                    currentWay.getSmoothness(), currentWay.getSurface(), currentWay.getOneWay(), currentWay.isLit(),
-                    currentWay.isPrimary(), currentWay.getLanesNo(), currentWay.getWayId(), currentWay.getCurrentWeather(),
-                    currentWay.getWayDensity()));
+            ThreadLocalRandom rand = ThreadLocalRandom.current();
+
+            double limit = currentWay.getSpeedLimit();
+            double curvature = currentWay.getCurvature();
+            double trueLength = currentWay.getTrueLength();
+            String wayType = currentWay.getWayType();
+            String smoothness = currentWay.getSmoothness();
+            String surface = currentWay.getSurface();
+            boolean isOneWay = currentWay.getOneWay();
+            boolean isLit = currentWay.isLit();
+            boolean isPrimary = currentWay.isPrimary();
+            int lanesNo = currentWay.getLanesNo();
+            int wayId = currentWay.getWayId();
+            Weather.weatherType weather = currentWay.getCurrentWeather();
+            double density = currentWay.getWayDensity();
+
+            for (int i = 0; i < Main.CAR_SCALE; i++) {
+                // Losujemy prędkość w przedziale [90%, 110%] prędkości zarejestrowanej
+                double randomizedSpeed = currentSpeeed * rand.nextDouble(0.90, 1.10);
+                violationsQueue.offer(new Main.Record(
+                        absTime, randomizedSpeed, limit, curvature, trueLength,
+                        wayType, smoothness, surface, isOneWay, isLit, isPrimary,
+                        lanesNo, wayId, weather, density
+                ));
+            }
         }
 
         if (distTravelled >= currentWay.getTrueLength()) {
@@ -211,7 +233,6 @@ public class Car {
                 giveUp();
                 distTravelled = 0;
                 currentSpeeed = 0;
-//                currentWay.leaveWay();
             } else if (!blockedByCongestion) {
                 distTravelled -= currentWay.getTrueLength();
 
@@ -225,18 +246,19 @@ public class Car {
                 currentWay.updateDensity();
                 reportMade = false;
             } else {
-
                 distTravelled = currentWay.getTrueLength();
                 currentSpeeed = 0.0;
             }
         }
     }
+
     public void printDiagnostics() {
         System.out.printf("   Status celu: %s\n", arrived ? "Osiągnięty" : "W drodze");
         System.out.printf("   Aktualna prędkość: %.2f m/s\n", currentSpeeed);
         System.out.printf("   Przebyty dystans na obecnym odcinku: %.2f m\n", distTravelled);
     }
-    public boolean getArrived(){
+
+    public boolean getArrived() {
         return arrived;
     }
 
@@ -255,9 +277,8 @@ public class Car {
         this.path = newPath;
         this.currentWayIndex = 0;
         this.currentWay = newPath.get(0);
+        this.reportMade = false;
         rerouteAttempts = 0;
         return true;
     }
-
-
 }

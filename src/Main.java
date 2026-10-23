@@ -1,10 +1,8 @@
 import java.io.BufferedWriter;
-import java.io.File;
 import java.io.FileWriter;
 import java.util.ArrayList;
-import java.util.ConcurrentModificationException;
 import java.util.List;
-import java.util.Map;
+import java.util.Locale;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
@@ -12,43 +10,44 @@ import java.util.stream.IntStream;
 
 public class Main {
 
+    // Mnożnik skalowania: 1 instancja Car = 10 rzeczywistych samochodów
+    public static final int CAR_SCALE = 10;
+
+    // Rzeczywiste cele (zostaną podzielone przez CAR_SCALE w getCarsCount)
     private static final int[] TARGETS = {
             1000, 700, 500, 500, 800, 2200, 6000, 10000, 9000, 6500, 5500, 5500, 6000, 7000, 8000, 11000, 10000,
             8000, 6000, 5000, 4000, 3000, 2000, 1000
     };
 
-
-
     private static int getCarsCount(int absTime) {
         int secondsInDay = absTime % 86400;
-        int currHour = secondsInDay / 3600;
-        int nextHour = (currHour + 1) % 24;
-        int idx = currHour % TARGETS.length;
+        int currHour = (secondsInDay / 3600) % TARGETS.length;
+        int nextHour = (currHour + 1) % TARGETS.length;
 
         double fractionHour = (secondsInDay % 3600) / 3600.0;
-        double target = TARGETS[idx ] + fractionHour * (TARGETS[idx] - TARGETS[idx]);
+        // POPRAWKA: Interpolacja między currHour a nextHour (wcześniej było TARGETS[idx] - TARGETS[idx])
+        double target = TARGETS[currHour] + fractionHour * (TARGETS[nextHour] - TARGETS[currHour]);
 
-        return (int) Math.round(target);
+        // Skalujemy liczbę instancji 10-krotnie w dół
+        return (int) Math.round(target / CAR_SCALE);
     }
+
     public static final LinkedBlockingQueue<Record> violations = new LinkedBlockingQueue<>();
     public static final AtomicBoolean isRunning = new AtomicBoolean(true);
-    public static final ConcurrentMap<RouteKey, List<Way>> routeCache = new ConcurrentHashMap<>();
+    public static final ConcurrentMap<RouteKey, List<Way>> routeCache = new ConcurrentHashMap<>(16384);
 
     private static double currentSimulatedTarget = 0;
 
-
     public static void main(String[] args) {
         try {
-            double transitionSpeed = 2.0;
+            // Szybkość przejścia również przeskalowana odpowiednio do mniejszej liczby obiektów
+            double transitionSpeed = 2.0 / CAR_SCALE;
 
-            String skrzyzowania = "/home/mendawg/moje/skrypty/carsim2/czesc_python/intersections.csv";
-            String drogi = "/home/mendawg/moje/skrypty/carsim2/czesc_python/road_segments.csv";
+            String skrzyzowania = "intersections.csv";
+            String drogi = "road_segments.csv";
 
-            Map<Long, Intersection> intersections = DataLoader.loadIntersections(skrzyzowania);
-            List<Way> ways = DataLoader.loadWays(drogi);
-
-
-
+            // POPRAWKA: Usunięto redundantne wywołania loadIntersections i loadWays,
+            // ponieważ linkWays i tak ładuje je od nowa.
             System.out.println("Ładowanie grafu dróg...");
             List<Intersection> graph = DataLoader.linkWays(skrzyzowania, drogi);
             System.out.println("Załadowano skrzyżowań: " + graph.size());
@@ -56,76 +55,65 @@ public class Main {
             Weather weather = new Weather(graph);
             AStar pathFinder = new AStar();
             int dt = 1;
-            List<Car> cars = new ArrayList<>();
+            List<Car> cars = new ArrayList<>(1500);
 
-
-            System.out.println("Rozpoczynam symulację...");
             long simulationSteps = 3600 * 24 * 1;
 
             System.out.println("Uruchamianie asynchronicznego zapisywania I/O...");
             Thread writer = new Thread(() -> {
-                try (BufferedWriter reportWriter = new BufferedWriter(new FileWriter("violations.csv"))){
+                // Zwiększony bufor zapisu (64 KB) dla wyższej wydajności przy 10x większej liczbie logów na fotoradar
+                try (BufferedWriter reportWriter = new BufferedWriter(new FileWriter("violations.csv"), 65536)) {
+                    // POPRAWKA: Dodano brakującą kolumnę 'density' w nagłówku CSV
                     reportWriter.write("time,speed,limit,curvature,true_length,way_type,smoothness," +
-                            "surface,is_one_way,is_lit,is_primary,lanes_no,way_id,weather\n");
-                    while (isRunning.get() || !violations.isEmpty()){
-                        Record record = violations.poll(100, TimeUnit.MILLISECONDS);
-                        if (record != null){
-                            reportWriter.write(String.format(java.util.Locale.US,
-                                    "%.1f,%.2f,%.1f,%.4f,%.2f,%s,%s,%s,%b,%b,%b,%d,%d,%s,%.4f\n",
-                                    record.time,
-                                    record.speed,
-                                    record.limit,
-                                    record.curvature,
-                                    record.trueLength,
-                                    record.wayType,
-                                    record.smoothness,
-                                    record.surface,
-                                    record.isOneWay,
-                                    record.isLit,
-                                    record.isPrimary,
-                                    record.lanesNo,
-                                    record.wayId,
-                                    record.weather,
-                                    record.density
-                            ));
+                            "surface,is_one_way,is_lit,is_primary,lanes_no,way_id,weather,density\n");
+
+                    List<Record> batch = new ArrayList<>(256);
+                    while (isRunning.get() || !violations.isEmpty()) {
+                        Record first = violations.poll(100, TimeUnit.MILLISECONDS);
+                        if (first != null) {
+                            batch.add(first);
+                            violations.drainTo(batch, 255); // Pobieramy paczkę rekordów naraz, by zredukować blokady
+                            for (Record record : batch) {
+                                reportWriter.write(String.format(Locale.US,
+                                        "%.1f,%.2f,%.1f,%.4f,%.2f,%s,%s,%s,%b,%b,%b,%d,%d,%s,%.4f\n",
+                                        record.time,
+                                        record.speed,
+                                        record.limit,
+                                        record.curvature,
+                                        record.trueLength,
+                                        record.wayType,
+                                        record.smoothness,
+                                        record.surface,
+                                        record.isOneWay,
+                                        record.isLit,
+                                        record.isPrimary,
+                                        record.lanesNo,
+                                        record.wayId,
+                                        record.weather,
+                                        record.density
+                                ));
+                            }
+                            batch.clear();
                         }
                     }
-                } catch (Exception e){
+                } catch (Exception e) {
                     e.printStackTrace();
                 }
             });
             writer.start();
 
-//            for (int step = 0; step < simulationSteps; step++) {
-//                int absoluteTime = step * dt;
-//                weather.checkEvents((int)absoluteTime);
-//                if (absoluteTime % 3600 == 0){
-//                    int hour = ((int) (step * dt) % 86400) / 3600;
-//                    if (hour == 5){
-//                        weather.changeWeather(absoluteTime);
-//                    }
-//                }
-//                cars.removeIf(Car::getArrived);
-//
-//                int targetCount = getCarsCount(absoluteTime);
-//                while (cars.size() < targetCount) {
-//                    cars.add(new Car(graph, pathFinder, dt));
-//                }
-//                cars.parallelStream().forEach(car -> car.move(absoluteTime));
-//            }
             System.out.println("Rozpoczynam symulację...");
-
-            // Wydłużamy symulację do 6 pełnych godzin (21600 kroków), aby załapać zmianę pogody o 5:00
 
             long realStartTime = System.currentTimeMillis();
             long totalPhase1Time = 0;
             long totalPhase2Time = 0;
+
             for (int step = 0; step < simulationSteps; step++) {
                 int absoluteTime = step * dt;
                 long phase1Start = System.nanoTime();
                 weather.checkEvents(absoluteTime);
 
-                if (absoluteTime % 3600 == 0 && absoluteTime > 0){
+                if (absoluteTime % 3600 == 0 && absoluteTime > 0) {
                     int hour = (absoluteTime % 86400) / 3600;
                     if (hour == 5) {
                         System.out.println(">>> ZMIANA POGODY O 5:00 <<<");
@@ -137,67 +125,59 @@ public class Main {
 
                 int realTarget = getCarsCount(absoluteTime);
 
-                // Inicjalizacja przy pierwszym kroku, aby uniknąć skoku z 0 do 500
                 if (step == 0) {
                     currentSimulatedTarget = realTarget;
+                    System.out.println("Inicjalizacja: Trwa wyznaczanie tras (A*) dla początkowych "
+                            + realTarget + " grup aut (odpowiada " + (realTarget * CAR_SCALE) + " autom). Proszę czekać...");
                 }
 
-                // 3. Liniowe dążenie currentSimulatedTarget do realTarget
-                // To sprawia, że cel "płynie" zamiast skakać
                 if (currentSimulatedTarget < realTarget) {
                     currentSimulatedTarget = Math.min(realTarget, currentSimulatedTarget + transitionSpeed);
                 } else if (currentSimulatedTarget > realTarget) {
                     currentSimulatedTarget = Math.max(realTarget, currentSimulatedTarget - transitionSpeed);
                 }
 
-                // Przechowujemy cel do celów diagnostycznych (żeby w logach widzieć "płynący" cel)
-                int targetForThisStep = (int) currentSimulatedTarget;
-                int targetCount = getCarsCount(absoluteTime);
-
-                // Raportujemy ciężką inicjalizację przy pierwszym kroku
-                if (step == 0) {
-                    System.out.println("Inicjalizacja: Trwa wyznaczanie tras (A*) dla początkowych " + targetCount + " aut. Proszę czekać...");
-                }
-
+                int targetForThisStep = (int) Math.round(currentSimulatedTarget);
                 int carsNeeded = targetForThisStep - cars.size();
-                if (carsNeeded > 0){
-                    List<Car> newCars = IntStream.range(0,carsNeeded).parallel()
-                            .mapToObj(i -> new Car(graph,  pathFinder, dt,violations, routeCache)).collect(Collectors.toList());
+
+                if (carsNeeded > 0) {
+                    List<Car> newCars = IntStream.range(0, carsNeeded).parallel()
+                            .mapToObj(i -> new Car(graph, pathFinder, dt, violations, routeCache))
+                            .toList();
                     cars.addAll(newCars);
                 }
                 long phase1End = System.nanoTime();
                 totalPhase1Time += (phase1End - phase1Start);
-                // Wielowątkowy ruch fizyki
-                long phase2Start = System.nanoTime();
 
+                long phase2Start = System.nanoTime();
                 cars.parallelStream().forEach(car -> car.move(absoluteTime));
-                // ==========================================
-                // TELEMETRIA: Diagnostyka co 60 wirtualnych sekund
-                // ==========================================
+
                 if (absoluteTime % 60 == 0) {
                     int h = (absoluteTime % 86400) / 3600;
                     int m = (absoluteTime % 3600) / 60;
 
-                    System.out.printf("[Czas: %02d:%02d] Auta: %d / Cel: %d\n",
-                            h, m, cars.size(), targetCount);
+                    System.out.printf("[Czas: %02d:%02d] Instancje aut: %d / Cel: %d (Rzeczywiste: %d / %d)\n",
+                            h, m, cars.size(), realTarget, cars.size() * CAR_SCALE, realTarget * CAR_SCALE);
                 }
                 long phase2End = System.nanoTime();
                 totalPhase2Time += (phase2End - phase2Start);
             }
+
             isRunning.set(false);
             writer.join();
+
             double p1Seconds = totalPhase1Time / 1_000_000_000.0;
             double p2Seconds = totalPhase2Time / 1_000_000_000.0;
-            System.out.printf("Czas spędzony w Fazie 1 (Tworzenie aut/I/O - 1 wątek): %.2f s\n", p1Seconds);
+            System.out.printf("Czas spędzony w Fazie 1 (Tworzenie aut/Pogoda): %.2f s\n", p1Seconds);
             System.out.printf("Czas spędzony w Fazie 2 (Fizyka - wielowątkowo): %.2f s\n", p2Seconds);
             System.out.println("Cached routes: " + routeCache.size());
             long realEndTime = System.currentTimeMillis();
             System.out.printf("\nSymulacja zakończona! Obliczenie %d kroków zajęło %.2f sekund w czasie rzeczywistym.\n",
                     simulationSteps, (realEndTime - realStartTime) / 1000.0);
 
-        }catch (Exception e){
+        } catch (Exception e) {
             e.printStackTrace();
-    }
+        }
     }
 
     public static class Record {
@@ -210,11 +190,11 @@ public class Main {
 
         public final String wayType;
         public final String smoothness;
-        private final String surface;
+        public final String surface;
 
         public final boolean isOneWay;
         public final boolean isLit;
-        private final boolean isPrimary;
+        public final boolean isPrimary;
 
         public final int lanesNo;
         public final int wayId;
@@ -241,5 +221,4 @@ public class Main {
             this.density = density;
         }
     }
-
 }

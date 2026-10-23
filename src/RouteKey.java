@@ -1,9 +1,6 @@
-import java.util.Objects;
-
 public class RouteKey {
-    private long startId;
-    private long endId;
-
+    private final long startId;
+    private final long endId;
 
     public RouteKey(long startId, long endId) {
         this.startId = startId;
@@ -12,7 +9,7 @@ public class RouteKey {
 
     @Override
     public int hashCode() {
-        return Objects.hash(startId,endId);
+        return Long.hashCode(startId) * 31 + Long.hashCode(endId);
     }
 
     @Override
